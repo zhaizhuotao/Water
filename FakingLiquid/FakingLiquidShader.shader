@@ -3,8 +3,11 @@
 		_Color ("Color", Color) = (1,1,1,1)
 		_MainTex ("Albedo (RGB)", 2D) = "white" {}
         [NoScaleOffset]_FlowMap("Flow Map(RG)",2D)="white"{}
-        _UJump("U Jump",Range(-0.25,0.25)) = 0.25
-        _VJump("V Jump",Range(-0.25,0.25)) = 0.25
+        [NoScaleOffset]_NormalMap("Normals",2D) = "bump"{}
+        _Tiling ("Tiling", Float) = 1
+        _Speed ("Speed",Float) = 1
+        _GridResolution("Grid Resolution",Float) = 10
+        _FlowStrength("FlowStrength",Float) = 1
 		_Glossiness ("Smoothness", Range(0,1)) = 0.5
 		_Metallic ("Metallic", Range(0,1)) = 0.0
 	}
@@ -21,6 +24,11 @@
 
 		sampler2D _MainTex;
         sampler2D _FlowMap;
+        sampler2D _NormalMap;
+        float _Tiling;
+        float _Speed;
+        float _FlowStrength;
+        float _GridResolution;
 		struct Input {
 			float2 uv_MainTex;
 		};
@@ -35,28 +43,54 @@
 		UNITY_INSTANCING_BUFFER_START(Props)
 			// put more per-instance properties here
 		UNITY_INSTANCING_BUFFER_END(Props)
-        float3 FlowUVW(float2 uv,float2 flowVector,float2 jump,float time,bool flowB){
-            float phaseOffset = flowB? 0.5:0;
-            float progress = frac(time + phaseOffset);
-            float3 uvw;
-            uvw.xy = uv - flowVector * progress + phaseOffset;
-            uvw.xy += (time - progress) * jump;
-            uvw.z = 1 - abs(1-2*progress);
-            return uvw;
+        float2 DirectionalFlowUV(float2 uv,float3 flowVectorAndSpeed,float tiling,float time,out float2x2 rotation){
+            float2 dir = normalize(flowVectorAndSpeed.xy);
+            rotation = float2x2(dir.y,dir.x,-dir.x,dir.y);
+            uv = mul(float2x2(dir.y,-dir.x,dir.x,dir.y),uv);
+            uv.y -= time * 0.01;
+            return uv * tiling;
         }
-		void surf (Input IN, inout SurfaceOutputStandard o) {
-            float2 flowVector = tex2D(_FlowMap,IN.uv_MainTex).rg *2 -1;
-            float noise = tex2D(_FlowMap,IN.uv_MainTex).a;
-            float time = _Time.y * noise;
-            float2 jump = float2(_UJump,_VJump);
-            float3 uvwA = FlowUVW(IN.uv_MainTex,flowVector,jump,time,false);
-            float3 uvwB = FlowUVW(IN.uv_MainTex,flowVector,jump,time,true);
-            fixed4 texA = tex2D(_MainTex,uvwA.xy)*uvwA.z;
-            fixed4 texB = tex2D(_MainTex,uvwB.xy)*uvwB.z;
-			// Albedo comes from a texture tinted by color
-			fixed4 c = (texA + texB) * _Color;
+        float3 UnpackDerivativeHeight(float4 textureData)
+        {
+            float3 dh = textureData.agb;
+            dh.xy = dh.xy * 2 - 1;
+            return dh;
+        }
+        float3 FlowCell(float2 uv,float2 offset,float time)
+        {
+            float2 shift = 1 - offset;
+            shift *= 0.5;
+            offset *= 0.5;
+            float2x2 derivRotation;
+            float2 uvTiled = (floor(uv * _GridResolution + offset)+shift) / _GridResolution;
+            float3 flow = tex2D(_FlowMap,uvTiled * 0.5).rgb;
+            flow.xy = flow.xy * 2 -1;
+            flow.z *= _FlowStrength;
+            float2 uvFlow = DirectionalFlowUV(uv + offset,flow,_Tiling,time,derivRotation);
+            float3 dh = UnpackDerivativeHeight(tex2D(_MainTex,uvFlow));
+            dh.xy = mul(derivRotation,dh.xy);
+            return dh;
+        }
+        float3 FlowGrid(float2 uv,float time)
+        {
+            float3 dhA = FlowCell(uv,float2(0,0),time);
+            float3 dhB = FlowCell(uv,float2(1,0),time);
+            float3 dhC = FlowCell(uv, float2(0, 1), time);
+            float3 dhD = FlowCell(uv, float2(1, 1), time);
+            float2 t = abs(2 * frac(uv * _GridResolution) - 1);
+            float wA = (1 - t.x)*(1-t.y);
+            float wB = t.x*(1-t.y);
+            float wC = (1 - t.x)*t.y;
+            float wD = t.x*t.y;
+            return dhA * wA + dhB * wB + dhC * wC + dhD * wD;
+        }
+		void surf (Input IN, inout SurfaceOutputStandard o) 
+        {
+            float time = _Time.y * _Speed;
+            float3 dh = FlowGrid(IN.uv_MainTex,time);
+            fixed4 c = dh.z * dh.z * _Color;
 			o.Albedo = c.rgb;
-			// Metallic and smoothness come from slider variables
+            o.Normal = normalize(float3(-dh.xy,1));
 			o.Metallic = _Metallic;
 			o.Smoothness = _Glossiness;
 			o.Alpha = c.a;
